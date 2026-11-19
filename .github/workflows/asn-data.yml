@@ -1,0 +1,68 @@
+# 週 1 回だけ iptoasn.com から取り、kanmon の build_asn.py で KASN1 に縮めて、
+# Release「asn-data」の添付ファイル（asn.kasn.gz・asn.kasn.gz.sha256）を差し替える。
+# 利用者の kanmond は iptoasn.com ではなく、この Release から取る（運営者の負荷を増やさない）。
+# 控えは zephel01/kanmon の tools/asn-data/asn-data.yml。
+name: asn-data
+
+on:
+  schedule:
+    - cron: "17 18 * * 0" # 毎週月曜 3:17（日本時間）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: asn-data
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: kanmon（変換スクリプトと AS の一覧）を取得
+        uses: actions/checkout@v4
+        with:
+          repository: zephel01/kanmon
+          ref: main
+          path: kanmon
+          persist-credentials: false
+
+      - name: iptoasn.com から取得
+        run: |
+          set -euo pipefail
+          curl -fsSL --proto '=https' --tlsv1.2 --max-time 120 --max-filesize 64000000 \
+            -o in.tsv.gz https://iptoasn.com/data/ip2asn-combined.tsv.gz
+          ls -l in.tsv.gz
+          gzip -t in.tsv.gz
+
+      - name: KASN1 に変換
+        run: |
+          set -euo pipefail
+          python3 kanmon/tools/asn-data/build_asn.py --tsv in.tsv.gz \
+            --lists kanmon/detections/22-asn.yaml --out asn.kasn.gz | tee build.log
+          # 途中で切れたデータを配らない（実データは v4 約 40 万件）
+          n4=$(sed -n 's/^v4 \([0-9]*\) .*/\1/p' build.log)
+          test "${n4:-0}" -ge 200000
+
+      - name: 変わっていれば Release を差し替える
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          new=$(cut -d' ' -f1 asn.kasn.gz.sha256)
+          if ! gh release view asn-data -R "$REPO" >/dev/null 2>&1; then
+            gh release create asn-data -R "$REPO" --title "ASN data (KASN1)" --latest=false \
+              --notes "kanmon 用の AS データ。元データ: iptoasn.com（PDDL v1.0）。毎週更新。"
+          fi
+          old=$(gh release download asn-data -R "$REPO" -p asn.kasn.gz.sha256 -O - 2>/dev/null | cut -d' ' -f1 || true)
+          if [ "$new" = "$old" ]; then
+            echo "変化なし（$new）"
+            exit 0
+          fi
+          # 本体 → .sha256 の順に差し替える（途中で取った kanmond は SHA-256 の不一致で前回分を使い続ける）
+          gh release upload asn-data -R "$REPO" --clobber asn.kasn.gz
+          gh release upload asn-data -R "$REPO" --clobber asn.kasn.gz.sha256
+          echo "更新 $old → $new"
